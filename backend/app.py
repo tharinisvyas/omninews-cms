@@ -1,8 +1,10 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
+from openai import OpenAI
 import os
 import requests
+import json
 from datetime import datetime
 
 # Load environment variables
@@ -21,9 +23,90 @@ CORS(app, resources={
 
 # Configuration
 NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 NEWS_API_URL = 'https://newsapi.org/v2/top-headlines'
 
-# Basic hello-world route
+# Initialize Groq client (OpenAI-compatible)
+def get_groq_client():
+    return OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1"
+    )
+
+# Liquid Content Generation Function
+def generate_liquid_content(article_text):
+    """
+    Transform raw article text into structured "Liquid Content" using Groq AI.
+    Returns a dictionary with executive_summary, timeline, and social_caption.
+    """
+    if not GROQ_API_KEY:
+        return {
+            "error": "GROQ_API_KEY not configured",
+            "executive_summary": [],
+            "timeline": [],
+            "social_caption": ""
+        }
+    
+    if not article_text or len(article_text.strip()) < 20:
+        return {
+            "error": "Article text too short or empty",
+            "executive_summary": [],
+            "timeline": [],
+            "social_caption": ""
+        }
+    
+    try:
+        client = get_groq_client()
+        
+        system_prompt = """You are an expert news content transformer. Analyze the provided article and return ONLY a valid JSON object with these exact keys:
+- executive_summary: Array of 3 bullet points summarizing the key points
+- timeline: Array of 2-3 key events mentioned chronologically
+- social_caption: A single sentence social media hook (engaging and punchy)
+
+Return ONLY the JSON object, no markdown formatting, no code blocks, no additional text."""
+        
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": f"Transform this article into liquid content:\n\n{article_text}"
+                }
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        # Extract the response text
+        response_text = response.choices[0].message.content.strip()
+        
+        # Parse JSON response
+        liquid_content = json.loads(response_text)
+        
+        return liquid_content
+    
+    except json.JSONDecodeError as e:
+        return {
+            "error": f"JSON parsing failed: {str(e)}",
+            "executive_summary": [],
+            "timeline": [],
+            "social_caption": "",
+            "raw_response": response_text if 'response_text' in locals() else None
+        }
+    
+    except Exception as e:
+        return {
+            "error": f"Failed to generate liquid content: {str(e)}",
+            "executive_summary": [],
+            "timeline": [],
+            "social_caption": ""
+        }
+
+
 @app.route('/', methods=['GET'])
 def hello_world():
     return jsonify({
@@ -41,11 +124,11 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat()
     }), 200
 
-# News API route
+# News API route with Liquid Content enrichment
 @app.route('/api/news', methods=['GET'])
 def get_news():
     """
-    Fetch top breaking news headlines from NewsAPI.
+    Fetch top breaking news headlines from NewsAPI and enrich with AI-generated Liquid Content.
     Optional query parameters:
     - country: Country code (default: 'us')
     - category: News category (e.g., 'business', 'technology', 'sports')
@@ -99,8 +182,8 @@ def get_news():
         
         # Process articles to return cleaner data
         processed_articles = []
-        for article in articles:
-            processed_articles.append({
+        for idx, article in enumerate(articles):
+            article_data = {
                 'id': len(processed_articles) + 1,
                 'title': article.get('title', ''),
                 'description': article.get('description', ''),
@@ -110,7 +193,15 @@ def get_news():
                 'author': article.get('author', 'Unknown'),
                 'publishedAt': article.get('publishedAt', ''),
                 'content': article.get('content', '')
-            })
+            }
+            
+            # Enrich top 3 articles with Liquid Content using Groq AI
+            if idx < 3:
+                article_text = f"{article_data['title']}\n\n{article_data['description']}\n\n{article_data['content']}"
+                liquid_content = generate_liquid_content(article_text)
+                article_data['liquid_content'] = liquid_content
+            
+            processed_articles.append(article_data)
         
         return jsonify({
             "status": "success",
@@ -118,7 +209,8 @@ def get_news():
             "count": len(processed_articles),
             "country": country,
             "category": category if category else "general",
-            "articles": processed_articles
+            "articles": processed_articles,
+            "enriched_count": min(3, len(processed_articles))
         }), 200
     
     except requests.exceptions.Timeout:
